@@ -11,6 +11,10 @@ The machines aren't going to make it easy.
 
 ---
 
+![App Screenshot](https://raw.githubusercontent.com/GearPlot/data-demise/refs/heads/main/screenshots/data-demise_01.png)
+
+![App Screenshot](https://raw.githubusercontent.com/GearPlot/data-demise/refs/heads/main/screenshots/data-demise_02.png)
+
 ## 🎮 The Game
 
 A rogue artificial intelligence has taken control of a heavily fortified data center. Security bots, autonomous drones, and hostile AI systems stand between you and the central mainframe.
