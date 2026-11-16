@@ -1,0 +1,2082 @@
+// ============================================================================
+//   DATA DEMISE - 2.5D CYBER-DOOM RAYCASTER FOR YABASIC
+//   Infiltrate the Rogue AI Data Center. Shatter the Cores. Survive.
+// ============================================================================
+
+clear screen
+
+// Window & Viewport Dimensions
+sw = 800
+sh = 600
+hud_y = 490
+vh = hud_y
+vh_half = int(vh / 2)
+
+// Raycaster Resolution (160 strips x 5px = 800px wide)
+strip_w = 5
+num_rays = int(sw / strip_w)
+
+open window sw, sh
+
+// Map & Entity Capacities
+map_w = 16
+map_h = 16
+max_ents = 40
+max_eproj = 24
+max_sparks = 50
+
+// Arrays
+dim wmap(map_w, map_h)
+dim z_buf(num_rays)
+dim row_str$(map_h)
+
+// Raycast & Delta-Column Buffers
+dim r_dtop(num_rays), r_dbot(num_rays), r_wt(num_rays), r_tcol(num_rays)
+dim r_shade(num_rays), r_mx(num_rays), r_my(num_rays), r_lh(num_rays)
+dim prev_dtop(num_rays), prev_dbot(num_rays), col_dirty(num_rays), next_dirty(num_rays)
+
+// Entities: 1=SentryBot, 2=SentinelDrone, 3=MainframeCore, 4=ApexOverlord, 5=Medkit, 6=Ammo
+dim ent_act(max_ents), ent_type(max_ents), ent_x(max_ents), ent_y(max_ents)
+dim ent_hp(max_ents), ent_maxhp(max_ents), ent_cd(max_ents), ent_flash(max_ents)
+dim ent_stun(max_ents), ent_bob(max_ents), ent_dist(max_ents)
+dim ent_scrx(max_ents), ent_tz(max_ents), ent_vis(max_ents)
+dim ent_vx1(max_ents), ent_vx2(max_ents), ent_padw(max_ents), ent_topy(max_ents), ent_boty(max_ents)
+dim draw_ord(max_ents)
+
+// Enemy Plasma Projectiles
+dim ep_act(max_eproj), ep_x(max_eproj), ep_y(max_eproj), ep_vx(max_eproj), ep_vy(max_eproj), ep_life(max_eproj), ep_dmg(max_eproj)
+dim ep_scrx(max_eproj), ep_tz(max_eproj), ep_rad(max_eproj), ep_vis(max_eproj)
+
+// 3D Impact Sparks
+dim sp_act(max_sparks), sp_x(max_sparks), sp_y(max_sparks), sp_z(max_sparks)
+dim sp_vx(max_sparks), sp_vy(max_sparks), sp_vz(max_sparks), sp_life(max_sparks), sp_col(max_sparks)
+dim sp_scrx(max_sparks), sp_scry(max_sparks), sp_sz(max_sparks), sp_vis(max_sparks)
+
+// Visual Tracer Effect
+tracer_timer = 0
+tracer_col = 1
+
+// HUD & Minimap Dirty-State Cache
+prev_score = -1 : prev_bots = -1 : prev_hp = -1 : prev_cores = -1
+prev_wep = -1 : prev_shl = -1 : prev_cel = -1 : prev_unlocked = -1 : prev_visor = -1
+dim prev_ent_mx(max_ents), prev_ent_my(max_ents)
+prev_pmx = -1 : prev_pmy = -1 : prev_plx = -1 : prev_ply = -1
+
+// Weapon & Viewport Overlay State
+prev_wx1 = int(sw / 2) - 30 : prev_wx2 = int(sw / 2) + 70 : prev_wy_top = vh - 115
+prev_banner_on = 0 : prev_hit_flash = 0
+
+hi_score = 0
+
+// ============================================================================
+// OUTER GAME LOOP
+// ============================================================================
+repeat
+    title_screen()
+
+    // New Run State
+    cur_floor = 1
+    score = 0
+    hp = 100
+    max_hp = 100
+    shells = 14
+    cells = 5
+    cur_wep = 1
+    run_active = 1
+    won_game = 0
+
+    while (run_active and cur_floor <= 3)
+        // Load Floor Map & Entities
+        load_floor(cur_floor)
+        floor_intro_screen(cur_floor, floor_name$)
+
+        // Draw static HUD & initialize delta buffers once per floor
+        draw_hud_static(cur_floor, floor_name$)
+
+        px = spawn_x
+        py = spawn_y
+        pa = 0.0
+        pv_fwd = 0.0
+        pv_str = 0.0
+        pa_vel = 0.0
+        walk_phase = 0.0
+
+        fire_cd = 0
+        fire_buf = 0
+        recoil = 0
+        muzzle_t = 0
+        hit_flash = 0
+        hit_mark = 0
+        shake = 0
+        status_msg$ = "LOCATE & DESTROY ALL AI CORES"
+        status_timer = 140
+        anim_clock = 0
+        floor_running = 1
+        floor_cleared = 0
+
+        // --------------------------------------------------------------------
+        // FLOOR GAMEPLAY LOOP
+        // --------------------------------------------------------------------
+        while (floor_running)
+            anim_clock = anim_clock + 1
+            if (fire_cd > 0) fire_cd = fire_cd - 1
+            if (recoil > 0) recoil = recoil * 0.72
+            if (recoil < 0.4) recoil = 0
+            if (muzzle_t > 0) muzzle_t = muzzle_t - 1
+            if (hit_flash > 0) hit_flash = hit_flash - 1
+            if (hit_mark > 0) hit_mark = hit_mark - 1
+            if (tracer_timer > 0) tracer_timer = tracer_timer - 1
+            if (status_timer > 0) status_timer = status_timer - 1
+
+            if (shake > 0.3) then
+                shake = shake * 0.80
+            else
+                shake = 0
+            endif
+            shk_x = (ran(2) - 1) * shake
+            shk_y = (ran(2) - 1) * shake
+
+            // ---------------------
+            // 1. INPUT PROCESSING
+            // ---------------------
+            k$ = inkey$(0)
+            while (k$ <> "")
+                if (k$ = "up" or k$ = "w" or k$ = "W") then
+                    pv_fwd = min(0.14, pv_fwd + 0.085)
+                elsif (k$ = "down" or k$ = "s" or k$ = "S") then
+                    pv_fwd = max(-0.12, pv_fwd - 0.075)
+                elsif (k$ = "left") then
+                    pa_vel = max(-0.13, pa_vel - 0.075)
+                elsif (k$ = "right") then
+                    pa_vel = min(0.13, pa_vel + 0.075)
+                elsif (k$ = "a" or k$ = "A") then
+                    pv_str = max(-0.12, pv_str - 0.075)
+                elsif (k$ = "d" or k$ = "D") then
+                    pv_str = min(0.12, pv_str + 0.075)
+                elsif (k$ = "1") then
+                    cur_wep = 1
+                elsif (k$ = "2") then
+                    cur_wep = 2
+                elsif (k$ = "3") then
+                    cur_wep = 3
+                elsif (k$ = " ") then
+                    fire_buf = 2
+                elsif (k$ = "q" or k$ = "Q" or k$ = "esc") then
+                    floor_running = 0
+                    run_active = 0
+                endif
+                k$ = inkey$(0)
+            wend
+
+            if (fire_buf > 0) then
+                if (fire_cd = 0) then
+                    fire_weapon()
+                    fire_buf = 0
+                else
+                    fire_buf = fire_buf - 1
+                endif
+            endif
+
+            // ---------------------
+            // 2. PLAYER MOVEMENT & COLLISION
+            // ---------------------
+            pa = pa + pa_vel
+            pa_vel = pa_vel * 0.68
+            if (abs(pa_vel) < 0.002) pa_vel = 0
+
+            dir_x = cos(pa)
+            dir_y = sin(pa)
+            plane_x = -dir_y * 0.66
+            plane_y = dir_x * 0.66
+
+            move_dx = dir_x * pv_fwd - dir_y * pv_str
+            move_dy = dir_y * pv_fwd + dir_x * pv_str
+
+            if (abs(pv_fwd) + abs(pv_str) > 0.015) then
+                walk_phase = walk_phase + 0.28
+            endif
+
+            // Axis-separated wall + solid entity sliding
+            if (can_walk(px + move_dx, py)) px = px + move_dx
+            if (can_walk(px, py + move_dy)) py = py + move_dy
+
+            pv_fwd = pv_fwd * 0.76
+            pv_str = pv_str * 0.76
+            if (abs(pv_fwd) < 0.002) pv_fwd = 0
+            if (abs(pv_str) < 0.002) pv_str = 0
+
+            // ---------------------
+            // 3. UPDATE ENTITIES & AI
+            // ---------------------
+            cores_left = 0
+            boss_alive = 0
+            active_bots = 0
+            update_entities()
+
+            // ---------------------
+            // 4. UPDATE ENEMY PROJECTILES
+            // ---------------------
+            update_projectiles()
+
+            // ---------------------
+            // 5. UPDATE 3D SPARKS
+            // ---------------------
+            update_sparks()
+
+            // ---------------------
+            // 6. OBJECTIVE & EXIT CHECK
+            // ---------------------
+            if (cur_floor < 3) then
+                if (cores_left = 0 and exit_x > 0) then
+                    ed2 = (px - (exit_x + 0.5))*(px - (exit_x + 0.5)) + (py - (exit_y + 0.5))*(py - (exit_y + 0.5))
+                    if (ed2 < 1.15 * 1.15) then
+                        floor_cleared = 1
+                        floor_running = 0
+                    endif
+                endif
+            else
+                if (boss_alive = 0) then
+                    floor_cleared = 1
+                    floor_running = 0
+                    won_game = 1
+                endif
+            endif
+
+            if (hp <= 0) then
+                hp = 0
+                floor_running = 0
+                run_active = 0
+            endif
+
+            // ---------------------
+            // 7. RENDER 3D WORLD, WEAPON, CROSSHAIR & HUD
+            // ---------------------
+            render_frame(cur_floor, score, hp, max_hp, shells, cells, cur_wep, cores_left, active_bots, shk_x, shk_y)
+
+            sleep 0.018
+        wend
+
+        if (floor_cleared) then
+            score = score + cur_floor * 1000
+            cur_floor = cur_floor + 1
+        endif
+    wend
+
+    if (score > hi_score) hi_score = score
+
+    if (won_game) then
+        victory_screen(score, hi_score)
+    elsif (hp <= 0) then
+        game_over_screen(score, hi_score, cur_floor)
+    endif
+until (0)
+
+end
+
+// ============================================================================
+// FLOOR MAPS & ENTITY SPAWNER
+// ============================================================================
+
+sub load_floor(fnum)
+    local r, c, ch$, i
+
+    for i = 1 to max_ents : ent_act(i) = 0 : next i
+    for i = 1 to max_eproj : ep_act(i) = 0 : next i
+    for i = 1 to max_sparks : sp_act(i) = 0 : next i
+
+    exit_x = 0 : exit_y = 0
+
+    if (fnum = 1) then
+        floor_name$ = "SERVER FARM ALPHA"
+        row_str$(1)  = "################"
+        row_str$(2)  = "#P..#......#..E#"
+        row_str$(3)  = "#...#..C...#...#"
+        row_str$(4)  = "#......==......#"
+        row_str$(5)  = "###.########.###"
+        row_str$(6)  = "#...#..B...#...#"
+        row_str$(7)  = "#.B....==....D.#"
+        row_str$(8)  = "#..C#......#C..#"
+        row_str$(9)  = "#...#..A...#...#"
+        row_str$(10) = "###.########.###"
+        row_str$(11) = "#......H.......#"
+        row_str$(12) = "#..D...==...B..#"
+        row_str$(13) = "#......==......#"
+        row_str$(14) = "#..A........H..#"
+        row_str$(15) = "#..B........D..#"
+        row_str$(16) = "################"
+    elsif (fnum = 2) then
+        floor_name$ = "COOLING & NEURAL LABS"
+        row_str$(1)  = "================"
+        row_str$(2)  = "=P....====....E="
+        row_str$(3)  = "=.===.====.===.="
+        row_str$(4)  = "=.=C........C=.="
+        row_str$(5)  = "=.=...#..#...=.="
+        row_str$(6)  = "=.....#HA#.....="
+        row_str$(7)  = "===.=.#..#.=.==="
+        row_str$(8)  = "=..B........D..="
+        row_str$(9)  = "=.D...====...B.="
+        row_str$(10) = "=.....=..=.....="
+        row_str$(11) = "===.=.=..=.=.==="
+        row_str$(12) = "=.C...B..D...C.="
+        row_str$(13) = "=.===......===.="
+        row_str$(14) = "=..D...AA...B..="
+        row_str$(15) = "=....H....H....="
+        row_str$(16) = "================"
+    else
+        floor_name$ = "CENTRAL MAINFRAME VAULT"
+        row_str$(1)  = "%%%%%%%%%%%%%%%%"
+        row_str$(2)  = "%P.....%%.....H%"
+        row_str$(3)  = "%.%%........%%.%"
+        row_str$(4)  = "%.%C..====..C%.%"
+        row_str$(5)  = "%.....====.....%"
+        row_str$(6)  = "%.B..........D.%"
+        row_str$(7)  = "%%.%%......%%.%%"
+        row_str$(8)  = "%..A........A..%"
+        row_str$(9)  = "%......O.......%"
+        row_str$(10) = "%..D........B..%"
+        row_str$(11) = "%%.%%......%%.%%"
+        row_str$(12) = "%..............%"
+        row_str$(13) = "%.....====.....%"
+        row_str$(14) = "%.%C..====..C%.%"
+        row_str$(15) = "%H.....%%.....A%"
+        row_str$(16) = "%%%%%%%%%%%%%%%%"
+    endif
+
+    for r = 1 to map_h
+        for c = 1 to map_w
+            ch$ = mid$(row_str$(r), c, 1)
+            wmap(c, r) = 0
+            if (ch$ = "#") then
+                wmap(c, r) = 1
+            elsif (ch$ = "=") then
+                wmap(c, r) = 2
+            elsif (ch$ = "%") then
+                wmap(c, r) = 3
+            elsif (ch$ = "E") then
+                wmap(c, r) = 4
+                exit_x = c
+                exit_y = r
+            elsif (ch$ = "P") then
+                spawn_x = c + 0.5
+                spawn_y = r + 0.5
+            elsif (ch$ = "B") then
+                spawn_ent(1, c + 0.5, r + 0.5, 45 + fnum * 10)
+            elsif (ch$ = "D") then
+                spawn_ent(2, c + 0.5, r + 0.5, 32 + fnum * 8)
+            elsif (ch$ = "C") then
+                spawn_ent(3, c + 0.5, r + 0.5, 130 + fnum * 20)
+            elsif (ch$ = "O") then
+                spawn_ent(4, c + 0.5, r + 0.5, 650)
+            elsif (ch$ = "H") then
+                spawn_ent(5, c + 0.5, r + 0.5, 1)
+            elsif (ch$ = "A") then
+                spawn_ent(6, c + 0.5, r + 0.5, 1)
+            endif
+        next c
+    next r
+end sub
+
+sub spawn_ent(t, x, y, maxhp)
+    local i, idx
+    idx = -1
+    for i = 1 to max_ents
+        if (ent_act(i) = 0) then
+            idx = i
+            break
+        endif
+    next i
+    if (idx <> -1) then
+        ent_act(idx) = 1
+        ent_type(idx) = t
+        ent_x(idx) = x
+        ent_y(idx) = y
+        ent_hp(idx) = maxhp
+        ent_maxhp(idx) = maxhp
+        ent_cd(idx) = 30 + int(ran(45))
+        ent_flash(idx) = 0
+        ent_stun(idx) = 0
+        ent_bob(idx) = ran(6.28)
+    endif
+end sub
+
+// ============================================================================
+// COLLISION & LINE OF SIGHT
+// ============================================================================
+
+sub can_walk(tx, ty)
+    local mx, my, i, d2, rad, t
+    rad = 0.24
+    for mx = int(tx - rad) to int(tx + rad)
+        for my = int(ty - rad) to int(ty + rad)
+            if (mx < 1 or mx > map_w or my < 1 or my > map_h) return 0
+            if (wmap(mx, my) > 0) return 0
+        next my
+    next mx
+
+    for i = 1 to max_ents
+        if (ent_act(i)) then
+            t = ent_type(i)
+            if (t = 1 or t = 2 or t = 3 or t = 4) then
+                d2 = (tx - ent_x(i))*(tx - ent_x(i)) + (ty - ent_y(i))*(ty - ent_y(i))
+                if (t = 4) then
+                    if (d2 < 0.72 * 0.72) return 0
+                else
+                    if (d2 < 0.45 * 0.45) return 0
+                endif
+            endif
+        endif
+    next i
+    return 1
+end sub
+
+sub bot_can_walk(self_idx, tx, ty)
+    local mx, my
+    mx = int(tx) : my = int(ty)
+    if (mx < 1 or mx > map_w or my < 1 or my > map_h) return 0
+    if (wmap(mx, my) > 0) return 0
+    if (wmap(int(tx - 0.2), int(ty - 0.2)) > 0) return 0
+    if (wmap(int(tx + 0.2), int(ty + 0.2)) > 0) return 0
+    if ((tx - px)*(tx - px) + (ty - py)*(ty - py) < 0.65 * 0.65) return 0
+    return 1
+end sub
+
+sub has_los(x1, y1, x2, y2)
+    local dx, dy, dist, steps, i, sx, sy
+    dx = x2 - x1 : dy = y2 - y1
+    dist = sqrt(dx*dx + dy*dy)
+    if (dist < 0.2) return 1
+    steps = int(dist * 5) + 1
+    for i = 1 to steps - 1
+        sx = x1 + (dx * i) / steps
+        sy = y1 + (dy * i) / steps
+        if (wmap(int(sx), int(sy)) > 0) return 0
+    next i
+    return 1
+end sub
+
+// ============================================================================
+// WEAPONS, SHOOTING & DAMAGE
+// ============================================================================
+
+sub fire_weapon()
+    local i, spread
+
+    if (cur_wep = 1) then
+        fire_cd = 6
+        recoil = 11
+        muzzle_t = 3
+        shoot_ray(pa, 22, 0, 1)
+    elsif (cur_wep = 2) then
+        if (shells <= 0) then
+            cur_wep = 1
+            status_msg$ = "OUT OF SHELLS - SWITCHED TO PULSE RIFLE"
+            status_timer = 75
+            return
+        endif
+        shells = shells - 1
+        fire_cd = 17
+        recoil = 20
+        muzzle_t = 4
+        shake = max(shake, 3.5)
+        for i = -2 to 2
+            spread = i * 0.042
+            shoot_ray(pa + spread, 18, 0, 3)
+        next i
+    elsif (cur_wep = 3) then
+        if (cells <= 0) then
+            cur_wep = 1
+            status_msg$ = "OUT OF CELLS - SWITCHED TO PULSE RIFLE"
+            status_timer = 75
+            return
+        endif
+        cells = cells - 1
+        fire_cd = 24
+        recoil = 24
+        muzzle_t = 5
+        shake = max(shake, 6.0)
+        shoot_ray(pa, 90, 1, 6)
+    endif
+end sub
+
+sub shoot_ray(ang, dmg, pierce, col_id)
+    local rdx, rdy, mx, my, ddx, ddy, stx, sty, sdx, sdy, side, hit, steps, wdist
+    local i, t, rx, ry, proj, perp, hrad, best_i, best_d, wx, wy
+
+    rdx = cos(ang) : rdy = sin(ang)
+    mx = int(px) : my = int(py)
+    if (abs(rdx) < 0.00001) then ddx = 1e9 else ddx = abs(1 / rdx) endif
+    if (abs(rdy) < 0.00001) then ddy = 1e9 else ddy = abs(1 / rdy) endif
+    if (rdx < 0) then stx = -1 : sdx = (px - mx) * ddx else stx = 1 : sdx = (mx + 1.0 - px) * ddx endif
+    if (rdy < 0) then sty = -1 : sdy = (py - my) * ddy else sty = 1 : sdy = (my + 1.0 - py) * ddy endif
+
+    hit = 0 : steps = 0
+    while (hit = 0 and steps < 38)
+        steps = steps + 1
+        if (sdx < sdy) then
+            sdx = sdx + ddx : mx = mx + stx : side = 0
+        else
+            sdy = sdy + ddy : my = my + sty : side = 1
+        endif
+        if (mx < 1 or mx > map_w or my < 1 or my > map_h) then
+            hit = 1
+        elsif (wmap(mx, my) > 0) then
+            hit = 1
+        endif
+    wend
+    if (side = 0) then wdist = sdx - ddx else wdist = sdy - ddy endif
+    if (wdist < 0.1) wdist = 0.1
+
+    if (pierce) then
+        for i = 1 to max_ents
+            if (ent_act(i)) then
+                t = ent_type(i)
+                if (t >= 1 and t <= 4) then
+                    rx = ent_x(i) - px : ry = ent_y(i) - py
+                    proj = rx * rdx + ry * rdy
+                    perp = abs(rx * rdy - ry * rdx)
+                    hrad = 0.34
+                    if (t = 4) hrad = 0.58
+                    if (proj > 0.2 and proj < wdist and perp < hrad) then
+                        damage_ent(i, dmg, 1)
+                        hit_mark = 5
+                    endif
+                endif
+            endif
+        next i
+        wx = px + rdx * wdist : wy = py + rdy * wdist
+        spawn_spark_burst(wx, wy, 0.5, 6, col_id)
+    else
+        best_i = -1 : best_d = wdist
+        for i = 1 to max_ents
+            if (ent_act(i)) then
+                t = ent_type(i)
+                if (t >= 1 and t <= 4) then
+                    rx = ent_x(i) - px : ry = ent_y(i) - py
+                    proj = rx * rdx + ry * rdy
+                    perp = abs(rx * rdy - ry * rdx)
+                    hrad = 0.32
+                    if (t = 4) hrad = 0.55
+                    if (proj > 0.2 and proj < best_d and perp < hrad) then
+                        best_d = proj
+                        best_i = i
+                    endif
+                endif
+            endif
+        next i
+
+        if (best_i <> -1) then
+            damage_ent(best_i, dmg, 0)
+            hit_mark = 4
+        else
+            wx = px + rdx * wdist : wy = py + rdy * wdist
+            spawn_spark_burst(wx, wy, 0.5, 4, col_id)
+        endif
+    endif
+
+    tracer_timer = 2
+    tracer_col = col_id
+end sub
+
+sub damage_ent(idx, dmg, stun_flag)
+    local t, actual_dmg, rem_cores, i
+    t = ent_type(idx)
+    actual_dmg = dmg
+
+    if (t = 4) then
+        rem_cores = 0
+        for i = 1 to max_ents
+            if (ent_act(i) and ent_type(i) = 3) rem_cores = rem_cores + 1
+        next i
+        if (rem_cores > 0) then
+            actual_dmg = max(4, int(dmg * 0.25))
+            status_msg$ = "BOSS SHIELDED! DESTROY " + str$(rem_cores) + " CORES FIRST"
+            status_timer = 65
+        endif
+    endif
+
+    ent_hp(idx) = ent_hp(idx) - actual_dmg
+    ent_flash(idx) = 4
+    if (stun_flag and (t = 1 or t = 2)) ent_stun(idx) = 45
+
+    spawn_spark_burst(ent_x(idx), ent_y(idx), 0.5, 6, 3)
+
+    if (ent_hp(idx) <= 0) then
+        ent_act(idx) = 0
+        shake = max(shake, 5.5)
+        if (t = 1) then
+            score = score + 150
+            spawn_spark_burst(ent_x(idx), ent_y(idx), 0.45, 16, 4)
+        elsif (t = 2) then
+            score = score + 200
+            spawn_spark_burst(ent_x(idx), ent_y(idx), 0.65, 16, 1)
+        elsif (t = 3) then
+            score = score + 500
+            shake = 10
+            spawn_spark_burst(ent_x(idx), ent_y(idx), 0.55, 26, 2)
+            rem_cores = 0
+            for i = 1 to max_ents
+                if (ent_act(i) and ent_type(i) = 3) rem_cores = rem_cores + 1
+            next i
+            if (rem_cores = 0) then
+                if (cur_floor < 3) then
+                    status_msg$ = "ALL CORES DESTROYED! PROCEED TO GREEN EXIT"
+                else
+                    status_msg$ = "BOSS SHIELD BROKEN! DESTROY THE OVERLORD!"
+                endif
+                status_timer = 180
+            else
+                status_msg$ = "CORE SHATTERED! " + str$(rem_cores) + " REMAINING"
+                status_timer = 90
+            endif
+        elsif (t = 4) then
+            score = score + 2500
+            shake = 16
+            spawn_spark_burst(ent_x(idx), ent_y(idx), 0.55, 36, 2)
+        endif
+    endif
+end sub
+
+// ============================================================================
+// ENTITY AI, PICKUPS, PROJECTILES & SPARKS
+// ============================================================================
+
+sub update_entities()
+    local i, t, dx, dy, dist, d2, spd, nx, ny, a, k
+
+    for i = 1 to max_ents
+        if (ent_act(i)) then
+            t = ent_type(i)
+            if (ent_flash(i) > 0) ent_flash(i) = ent_flash(i) - 1
+            if (ent_stun(i) > 0) ent_stun(i) = ent_stun(i) - 1
+            ent_bob(i) = ent_bob(i) + 0.14
+
+            dx = px - ent_x(i)
+            dy = py - ent_y(i)
+            d2 = dx*dx + dy*dy
+
+            if (t = 3) then
+                cores_left = cores_left + 1
+            elsif (t = 4) then
+                boss_alive = 1
+                active_bots = active_bots + 1
+                dist = sqrt(d2)
+                if (has_los(ent_x(i), ent_y(i), px, py)) then
+                    if (dist > 2.2) then
+                        nx = ent_x(i) + (dx / dist) * 0.024
+                        ny = ent_y(i) + (dy / dist) * 0.024
+                        if (bot_can_walk(i, nx, ent_y(i))) ent_x(i) = nx
+                        if (bot_can_walk(i, ent_x(i), ny)) ent_y(i) = ny
+                    endif
+                    ent_cd(i) = ent_cd(i) - 1
+                    if (ent_cd(i) <= 0) then
+                        a = atan(dy, dx)
+                        for k = -1 to 1
+                            spawn_eproj(ent_x(i), ent_y(i), a + k * 0.16, 0.13, 14)
+                        next k
+                        ent_cd(i) = 48
+                    endif
+                endif
+            elsif (t = 1 or t = 2) then
+                active_bots = active_bots + 1
+                if (ent_stun(i) = 0) then
+                    dist = sqrt(d2)
+                    if (dist < 11.5 and has_los(ent_x(i), ent_y(i), px, py)) then
+                        spd = 0.022
+                        if (t = 2) spd = 0.036
+                        if (dist > 1.6) then
+                            nx = ent_x(i) + (dx / dist) * spd
+                            ny = ent_y(i) + (dy / dist) * spd
+                            if (bot_can_walk(i, nx, ent_y(i))) ent_x(i) = nx
+                            if (bot_can_walk(i, ent_x(i), ny)) ent_y(i) = ny
+                        endif
+                        ent_cd(i) = ent_cd(i) - 1
+                        if (ent_cd(i) <= 0) then
+                            a = atan(dy, dx)
+                            if (t = 1) then
+                                spawn_eproj(ent_x(i), ent_y(i), a, 0.11, 12)
+                                ent_cd(i) = 62 + int(ran(20))
+                            else
+                                spawn_eproj(ent_x(i), ent_y(i), a, 0.14, 9)
+                                ent_cd(i) = 48 + int(ran(20))
+                            endif
+                        endif
+                    endif
+                endif
+            elsif (t = 5) then
+                if (d2 < 0.55 * 0.55 and hp < max_hp) then
+                    hp = min(max_hp, hp + 30)
+                    ent_act(i) = 0
+                    status_msg$ = "+30 HULL INTEGRITY RESTORED"
+                    status_timer = 65
+                endif
+            elsif (t = 6) then
+                if (d2 < 0.55 * 0.55) then
+                    shells = shells + 10
+                    cells = cells + 3
+                    ent_act(i) = 0
+                    status_msg$ = "+10 PLASMA SHELLS   +3 RAIL CELLS"
+                    status_timer = 65
+                endif
+            endif
+        endif
+    next i
+end sub
+
+sub spawn_eproj(x, y, ang, spd, dmg)
+    local i, idx
+    idx = -1
+    for i = 1 to max_eproj
+        if (ep_act(i) = 0) then
+            idx = i
+            break
+        endif
+    next i
+    if (idx <> -1) then
+        ep_act(idx) = 1
+        ep_x(idx) = x + cos(ang) * 0.35
+        ep_y(idx) = y + sin(ang) * 0.35
+        ep_vx(idx) = cos(ang) * spd
+        ep_vy(idx) = sin(ang) * spd
+        ep_life(idx) = 95
+        ep_dmg(idx) = dmg
+    endif
+end sub
+
+sub update_projectiles()
+    local i, mx, my, d2
+    for i = 1 to max_eproj
+        if (ep_act(i)) then
+            ep_x(i) = ep_x(i) + ep_vx(i)
+            ep_y(i) = ep_y(i) + ep_vy(i)
+            ep_life(i) = ep_life(i) - 1
+            mx = int(ep_x(i)) : my = int(ep_y(i))
+            if (ep_life(i) <= 0 or mx < 1 or mx > map_w or my < 1 or my > map_h) then
+                ep_act(i) = 0
+            elsif (wmap(mx, my) > 0) then
+                spawn_spark_burst(ep_x(i), ep_y(i), 0.5, 3, 4)
+                ep_act(i) = 0
+            else
+                d2 = (ep_x(i) - px)*(ep_x(i) - px) + (ep_y(i) - py)*(ep_y(i) - py)
+                if (d2 < 0.32 * 0.32) then
+                    hp = hp - ep_dmg(i)
+                    hit_flash = 6
+                    shake = max(shake, 7)
+                    ep_act(i) = 0
+                endif
+            endif
+        endif
+    next i
+end sub
+
+sub spawn_spark_burst(x, y, z, count, col_id)
+    local i, s, idx, ang, spd
+    for i = 1 to count
+        idx = -1
+        for s = 1 to max_sparks
+            if (sp_act(s) = 0) then
+                idx = s
+                break
+            endif
+        next s
+        if (idx <> -1) then
+            ang = ran(6.28)
+            spd = 0.02 + ran(0.06)
+            sp_act(idx) = 1
+            sp_x(idx) = x : sp_y(idx) = y : sp_z(idx) = z
+            sp_vx(idx) = cos(ang) * spd
+            sp_vy(idx) = sin(ang) * spd
+            sp_vz(idx) = (ran(0.06) - 0.015)
+            sp_life(idx) = 12 + int(ran(14))
+            sp_col(idx) = col_id
+        endif
+    next i
+end sub
+
+sub update_sparks()
+    local i
+    for i = 1 to max_sparks
+        if (sp_act(i)) then
+            sp_x(i) = sp_x(i) + sp_vx(i)
+            sp_y(i) = sp_y(i) + sp_vy(i)
+            sp_z(i) = sp_z(i) + sp_vz(i)
+            sp_vz(i) = sp_vz(i) - 0.004
+            if (sp_z(i) < 0.05) then
+                sp_z(i) = 0.05
+                sp_vz(i) = -sp_vz(i) * 0.45
+            endif
+            sp_life(i) = sp_life(i) - 1
+            if (sp_life(i) <= 0) sp_act(i) = 0
+        endif
+    next i
+end sub
+
+// ============================================================================
+// FAST DELTA RAYCASTER + WEAPON-PROTECTED RENDER PIPELINE
+// ============================================================================
+
+sub clip_fill_rect(x1, y1, x2, y2, cx1, cy1, cx2, cy2)
+    local rx1, ry1, rx2, ry2
+    rx1 = max(cx1, min(x1, x2))
+    rx2 = min(cx2, max(x1, x2))
+    if (rx1 > rx2) return
+    ry1 = max(cy1, min(y1, y2))
+    ry2 = min(cy2, max(y1, y2))
+    if (ry1 > ry2) return
+    fill rectangle rx1, ry1, rx2, ry2
+end sub
+
+sub mark_dirty_x(x1, x2)
+    local c0, c1, c
+    c0 = max(0, int(x1 / strip_w))
+    c1 = min(num_rays - 1, int(x2 / strip_w))
+    for c = c0 to c1
+        next_dirty(c) = 1
+    next c
+end sub
+
+sub draw_col_slice(c, y_min, y_max, full_bg, unlocked, sy_off)
+    local sx1, sx2, dtop, dbot, wt, tcol, shade, line_h, mx, my
+    local c_top, c_bot, w_top, w_bot, f_top, f_bot, b1, b2
+    local r, g, b, blink, led_y, vmax_y
+
+    if (y_min > y_max) return
+    vmax_y = vh - 1
+    sx1 = c * strip_w
+    sx2 = sx1 + strip_w - 1
+
+    dtop = r_dtop(c)
+    dbot = r_dbot(c)
+    wt = r_wt(c)
+    tcol = r_tcol(c)
+    shade = r_shade(c)
+    line_h = r_lh(c)
+    mx = r_mx(c)
+    my = r_my(c)
+
+    // 1) Ceiling & Upper Depth-Fog (only dirty/uncovered rows)
+    c_bot = min(y_max, dtop - 1)
+    if (full_bg) then
+        c_top = y_min
+    else
+        c_top = max(y_min, prev_dtop(c))
+    endif
+    if (c_bot >= c_top) then
+        b1 = max(c_top, 0) : b2 = min(c_bot, 169)
+        if (b2 >= b1) then color 6, 10, 22 : fill rectangle sx1, b1, sx2, b2 : endif
+        b1 = max(c_top, 170) : b2 = min(c_bot, 212)
+        if (b2 >= b1) then color 4, 6, 14 : fill rectangle sx1, b1, sx2, b2 : endif
+        b1 = max(c_top, 213) : b2 = min(c_bot, 276)
+        if (b2 >= b1) then color 2, 3, 8 : fill rectangle sx1, b1, sx2, b2 : endif
+    endif
+
+    // Clear previous status banner strip if needed
+    if (full_bg = 0 and prev_banner_on = 1 and c >= 38 and c <= 122) then
+        b1 = max(y_min, 10) : b2 = min(c_bot, 36)
+        if (b2 >= b1) then color 6, 10, 22 : fill rectangle sx1, b1, sx2, b2 : endif
+    endif
+
+    // 2) Wall Strip (clipped to y_min .. y_max)
+    w_top = max(y_min, dtop)
+    w_bot = min(y_max, dbot)
+    if (w_bot >= w_top) then
+        if (wt = 1) then
+            if (tcol = 0 or tcol = 7) then
+                r = 12 * shade : g = 18 * shade : b = 32 * shade
+            else
+                r = 26 * shade : g = 38 * shade : b = 64 * shade
+            endif
+            color r, g, b
+            fill rectangle sx1, w_top, sx2, w_bot
+
+            if (z_buf(c) < 7.5 and line_h > 28 and (tcol = 2 or tcol = 5)) then
+                blink = mod(int(anim_clock / 10) + mx * 3 + my * 7 + tcol, 5)
+                if (blink = 0) then
+                    color 0, 235 * shade, 255 * shade
+                elsif (blink = 1) then
+                    color 0, 255 * shade, 130 * shade
+                elsif (blink = 2) then
+                    color 255 * shade, 175 * shade, 0
+                else
+                    color 15 * shade, 22 * shade, 38 * shade
+                endif
+                led_y = int(vh_half - line_h * 0.22 + sy_off)
+                b1 = max(w_top, led_y) : b2 = min(w_bot, led_y + 3)
+                if (b2 >= b1) fill rectangle sx1 + 1, b1, sx2 - 1, b2
+                led_y = int(vh_half + line_h * 0.10 + sy_off)
+                b1 = max(w_top, led_y) : b2 = min(w_bot, led_y + 3)
+                if (b2 >= b1) fill rectangle sx1 + 1, b1, sx2 - 1, b2
+            endif
+        elsif (wt = 2) then
+            if (tcol = 3 or tcol = 4) then
+                r = 0 : g = 185 * shade : b = 255 * shade
+            else
+                r = 18 * shade : g = 30 * shade : b = 68 * shade
+            endif
+            color r, g, b
+            fill rectangle sx1, w_top, sx2, w_bot
+        elsif (wt = 3) then
+            if (tcol = 1 or tcol = 6) then
+                r = 210 * shade : g = 35 * shade : b = 65 * shade
+            else
+                r = 46 * shade : g = 20 * shade : b = 34 * shade
+            endif
+            color r, g, b
+            fill rectangle sx1, w_top, sx2, w_bot
+        elsif (wt = 4) then
+            if (unlocked) then
+                if (mod(tcol + int(anim_clock / 4), 2) = 0) then
+                    color 0, 255 * shade, 145 * shade
+                else
+                    color 0, 170 * shade, 220 * shade
+                endif
+                fill rectangle sx1, w_top, sx2, w_bot
+            else
+                color 42 * shade, 46 * shade, 58 * shade
+                fill rectangle sx1, w_top, sx2, w_bot
+                color 235 * shade, 40 * shade, 55 * shade
+                led_y = int(vh_half + sy_off)
+                b1 = max(w_top, led_y - 4) : b2 = min(w_bot, led_y + 4)
+                if (b2 >= b1) fill rectangle sx1, b1, sx2, b2
+            endif
+        endif
+    endif
+
+    // 3) Lower Depth-Fog & Floor (only dirty/uncovered rows)
+    f_top = max(y_min, dbot + 1)
+    if (full_bg) then
+        f_bot = y_max
+    else
+        f_bot = min(y_max, prev_dbot(c))
+    endif
+    if (f_bot >= f_top) then
+        b1 = max(f_top, 213) : b2 = min(f_bot, 276)
+        if (b2 >= b1) then color 2, 3, 8 : fill rectangle sx1, b1, sx2, b2 : endif
+        b1 = max(f_top, 277) : b2 = min(f_bot, 319)
+        if (b2 >= b1) then color 4, 6, 14 : fill rectangle sx1, b1, sx2, b2 : endif
+        b1 = max(f_top, 320) : b2 = min(f_bot, vmax_y)
+        if (b2 >= b1) then color 12, 18, 34 : fill rectangle sx1, b1, sx2, b2 : endif
+    endif
+end sub
+
+sub render_frame(fl, cur_score, cur_hp, m_hp, n_shl, n_cel, wep, cores, bots, sx_off, sy_off)
+    local c, cam_x, rdx, rdy, mx, my, ddx, ddy, stx, sty, sdx, sdy
+    local hit, steps, side, wt, pdist, line_h, dtop, dbot, wall_u, tcol, shade, unlocked
+    local i, j, cnt, tmp, inv_det, rx, ry, tx, tz, scr_x
+    local bx, by, wy_bob, wx1, wx2, wy_top, ux1, ux2, uy_top, uc0, uc1, ux1_snap, ux2_snap
+    local vmax_y, spr_h, hw, c0, c1, vc0, vc1, vcnt, pad_w, rad, sz, sy, er, cy
+    local banner_on, tx1, tx2
+
+    vmax_y = vh - 1
+    unlocked = (cores = 0)
+
+    // Compute weapon geometry BEFORE drawing anything
+    wy_bob = sin(walk_phase) * 5
+    bx = int(sw / 2 + cos(walk_phase * 0.5) * 4 + sx_off)
+    by = int(vh + wy_bob + recoil + sy_off)
+    wx1 = bx - 28 : wx2 = bx + 68 : wy_top = by - 132
+
+    // Union of previous and current weapon bounding boxes -> Region B
+    ux1 = max(0, min(wx1, prev_wx1))
+    ux2 = min(sw - 1, max(wx2, prev_wx2))
+    uy_top = max(0, min(wy_top, prev_wy_top))
+    uc0 = max(0, int(ux1 / strip_w))
+    uc1 = min(num_rays - 1, int(ux2 / strip_w))
+    ux1_snap = uc0 * strip_w
+    ux2_snap = (uc1 + 1) * strip_w - 1
+
+    // -------------------------------------------------
+    // STEP 1: PURE MATH - RAYCAST ALL 160 RAYS
+    // -------------------------------------------------
+    for c = 0 to num_rays - 1
+        next_dirty(c) = 0
+        if (prev_hit_flash > 0) col_dirty(c) = 1
+
+        cam_x = 2 * c / (num_rays - 1) - 1
+        rdx = dir_x + plane_x * cam_x
+        rdy = dir_y + plane_y * cam_x
+
+        mx = int(px) : my = int(py)
+        if (abs(rdx) < 0.00001) then ddx = 1e9 else ddx = abs(1 / rdx) endif
+        if (abs(rdy) < 0.00001) then ddy = 1e9 else ddy = abs(1 / rdy) endif
+
+        if (rdx < 0) then stx = -1 : sdx = (px - mx) * ddx else stx = 1 : sdx = (mx + 1.0 - px) * ddx endif
+        if (rdy < 0) then sty = -1 : sdy = (py - my) * ddy else sty = 1 : sdy = (my + 1.0 - py) * ddy endif
+
+        hit = 0 : steps = 0 : wt = 1
+        while (hit = 0 and steps < 38)
+            steps = steps + 1
+            if (sdx < sdy) then
+                sdx = sdx + ddx : mx = mx + stx : side = 0
+            else
+                sdy = sdy + ddy : my = my + sty : side = 1
+            endif
+            if (mx < 1 or mx > map_w or my < 1 or my > map_h) then
+                hit = 1 : wt = 1
+            elsif (wmap(mx, my) > 0) then
+                hit = 1 : wt = wmap(mx, my)
+            endif
+        wend
+
+        if (side = 0) then pdist = sdx - ddx else pdist = sdy - ddy endif
+        if (pdist < 0.08) pdist = 0.08
+        z_buf(c) = pdist
+
+        line_h = int(vh / pdist)
+        dtop = max(0, min(vmax_y, int(vh_half - line_h / 2 + sy_off)))
+        dbot = max(dtop, min(vmax_y, int(vh_half + line_h / 2 + sy_off)))
+
+        if (side = 0) then wall_u = py + pdist * rdy else wall_u = px + pdist * rdx endif
+        wall_u = wall_u - int(wall_u)
+        tcol = int(wall_u * 8)
+
+        shade = min(1.0, 1.35 / (0.55 + pdist * 0.42))
+        if (side = 1) shade = shade * 0.72
+
+        r_dtop(c) = dtop : r_dbot(c) = dbot
+        r_wt(c) = wt : r_tcol(c) = tcol
+        r_shade(c) = shade : r_lh(c) = line_h
+        r_mx(c) = mx : r_my(c) = my
+    next c
+
+    // -------------------------------------------------
+    // STEP 2: PURE MATH - PROJECT & SORT ENTITIES/ORBS/SPARKS
+    // -------------------------------------------------
+    cnt = 0
+    for i = 1 to max_ents
+        ent_vis(i) = 0
+        if (ent_act(i)) then
+            cnt = cnt + 1
+            draw_ord(cnt) = i
+            ent_dist(i) = (ent_x(i) - px)*(ent_x(i) - px) + (ent_y(i) - py)*(ent_y(i) - py)
+        endif
+    next i
+
+    if (cnt > 1) then
+        for i = 1 to cnt - 1
+            for j = i + 1 to cnt
+                if (ent_dist(draw_ord(i)) < ent_dist(draw_ord(j))) then
+                    tmp = draw_ord(i)
+                    draw_ord(i) = draw_ord(j)
+                    draw_ord(j) = tmp
+                endif
+            next j
+        next i
+    endif
+
+    inv_det = 1.0 / (plane_x * dir_y - dir_x * plane_y)
+
+    for i = 1 to cnt
+        j = draw_ord(i)
+        rx = ent_x(j) - px : ry = ent_y(j) - py
+        tx = inv_det * (dir_y * rx - dir_x * ry)
+        tz = inv_det * (-plane_y * rx + plane_x * ry)
+        if (tz > 0.22) then
+            scr_x = int((sw / 2) * (1 + tx / tz) + sx_off)
+            spr_h = int(vh / tz)
+            if (spr_h >= 6) then
+                wt = ent_type(j)
+                hw = int(spr_h * 0.30)
+                if (wt = 4) hw = int(spr_h * 0.45)
+                if (wt = 5 or wt = 6) hw = int(spr_h * 0.20)
+                c0 = max(0, int((scr_x - hw) / strip_w))
+                c1 = min(num_rays - 1, int((scr_x + hw) / strip_w))
+                if (c1 >= 0 and c0 < num_rays) then
+                    vcnt = 0 : vc0 = num_rays : vc1 = -1
+                    for c = c0 to c1
+                        if (tz < z_buf(c) + 0.12) then
+                            vcnt = vcnt + 1
+                            if (c < vc0) vc0 = c
+                            if (c > vc1) vc1 = c
+                        endif
+                    next c
+                    if (vcnt > 0) then
+                        c = max(0, min(num_rays - 1, int(scr_x / strip_w)))
+                        if (vcnt >= (c1 - c0 + 1) * 0.40 or tz <= z_buf(c) + 0.12) then
+                            ent_vis(j) = 1
+                            ent_scrx(j) = scr_x
+                            ent_tz(j) = tz
+                            ent_vx1(j) = vc0 * strip_w
+                            ent_vx2(j) = (vc1 + 1) * strip_w - 1
+                            if (wt = 2) then
+                                pad_w = max(hw, int(max(3, int(spr_h * 0.16)) * 1.7) + 2)
+                                ent_topy(j) = 0 : ent_boty(j) = vmax_y
+                            elsif (wt = 4) then
+                                pad_w = max(hw, int(max(5, int(spr_h * 0.34)) * 1.35) + 2)
+                                ent_topy(j) = 0 : ent_boty(j) = vmax_y
+                            else
+                                pad_w = max(hw, int(spr_h * 0.25) + 2)
+                                ent_topy(j) = 0 : ent_boty(j) = vmax_y
+                            endif
+                            ent_padw(j) = pad_w
+                            mark_dirty_x(max(ent_vx1(j), scr_x - pad_w), min(ent_vx2(j), scr_x + pad_w))
+                        endif
+                    endif
+                endif
+            endif
+        endif
+    next i
+
+    for i = 1 to max_eproj
+        ep_vis(i) = 0
+        if (ep_act(i)) then
+            rx = ep_x(i) - px : ry = ep_y(i) - py
+            tx = inv_det * (dir_y * rx - dir_x * ry)
+            tz = inv_det * (-plane_y * rx + plane_x * ry)
+            if (tz > 0.20) then
+                scr_x = int((sw / 2) * (1 + tx / tz) + sx_off)
+                c = int(scr_x / strip_w)
+                if (c >= 0 and c < num_rays) then
+                    if (tz < z_buf(c)) then
+                        rad = max(2, min(18, int(36 / tz)))
+                        cy = int(vh_half + sy_off)
+                        if (cy - rad >= 0 and cy + rad <= vmax_y) then
+                            ep_vis(i) = 1
+                            ep_scrx(i) = scr_x
+                            ep_tz(i) = tz
+                            ep_rad(i) = rad
+                            mark_dirty_x(scr_x - rad, scr_x + rad)
+                        endif
+                    endif
+                endif
+            endif
+        endif
+    next i
+
+    for i = 1 to max_sparks
+        sp_vis(i) = 0
+        if (sp_act(i)) then
+            rx = sp_x(i) - px : ry = sp_y(i) - py
+            tx = inv_det * (dir_y * rx - dir_x * ry)
+            tz = inv_det * (-plane_y * rx + plane_x * ry)
+            if (tz > 0.20) then
+                scr_x = int((sw / 2) * (1 + tx / tz) + sx_off)
+                c = int(scr_x / strip_w)
+                if (c >= 0 and c < num_rays) then
+                    if (tz < z_buf(c)) then
+                        sy = int(vh_half + (0.5 - sp_z(i)) * (vh / tz) + sy_off)
+                        if (sy >= 2 and sy < vh - 4) then
+                            sz = max(1, min(4, int(5 / tz)))
+                            sp_vis(i) = 1
+                            sp_scrx(i) = scr_x
+                            sp_scry(i) = sy
+                            sp_sz(i) = sz
+                            mark_dirty_x(scr_x - sz, scr_x + sz)
+                        endif
+                    endif
+                endif
+            endif
+        endif
+    next i
+
+    if (tracer_timer > 0) then
+        tx1 = min(int(sw / 2) + 28, int(sw / 2) + sx_off) - 2
+        tx2 = max(int(sw / 2) + 29, int(sw / 2) + sx_off + 1) + 2
+        mark_dirty_x(tx1, tx2)
+    endif
+
+    // Crosshair columns always refresh cleanly
+    mark_dirty_x(int(sw / 2) - 10, int(sw / 2) + 10)
+
+    // -------------------------------------------------
+    // STEP 3: UPDATE HUD WHILE WEAPON IS STILL SOLID ON SCREEN
+    // -------------------------------------------------
+    draw_hud_dynamic(fl, cur_score, cur_hp, m_hp, n_shl, n_cel, wep, cores, bots)
+
+    // -------------------------------------------------
+    // STEP 4: PHASE A - DRAW OUTSIDE WEAPON BOX (REGION A)
+    // -------------------------------------------------
+    for c = 0 to num_rays - 1
+        if (c < uc0 or c > uc1) then
+            draw_col_slice(c, 0, vmax_y, col_dirty(c), unlocked, sy_off)
+        else
+            draw_col_slice(c, 0, uy_top - 1, col_dirty(c), unlocked, sy_off)
+        endif
+    next c
+
+    // Entities in Region A (top strip + left strip + right strip; circles if clear of Region B)
+    for i = 1 to cnt
+        j = draw_ord(i)
+        if (ent_vis(j)) then
+            scr_x = ent_scrx(j) : pad_w = ent_padw(j)
+            draw_entity_clipped(j, scr_x, ent_tz(j), sy_off, 0, 0, sw - 1, uy_top - 1, 0)
+            if (scr_x - pad_w < ux1_snap) then
+                draw_entity_clipped(j, scr_x, ent_tz(j), sy_off, 0, uy_top, ux1_snap - 1, vmax_y, 0)
+            endif
+            if (scr_x + pad_w > ux2_snap) then
+                draw_entity_clipped(j, scr_x, ent_tz(j), sy_off, ux2_snap + 1, uy_top, sw - 1, vmax_y, 0)
+            endif
+            if (scr_x + pad_w < ux1_snap or scr_x - pad_w > ux2_snap) then
+                draw_entity_circles(j, scr_x, ent_tz(j), sy_off)
+            else
+                // Draw circle in Phase A only if completely above uy_top
+                spr_h = int(vh / ent_tz(j))
+                if (ent_type(j) = 2) then
+                    cy = int(vh_half - spr_h * 0.08 + sin(ent_bob(j)) * (spr_h * 0.08) + sy_off)
+                    er = max(3, int(spr_h * 0.16))
+                    if (cy + er < uy_top) draw_entity_circles(j, scr_x, ent_tz(j), sy_off)
+                elsif (ent_type(j) = 4) then
+                    cy = int(vh_half - spr_h * 0.04 + sin(ent_bob(j) * 0.7) * (spr_h * 0.05) + sy_off)
+                    er = int(max(5, int(spr_h * 0.34)) * 1.25)
+                    if (cy + er < uy_top) draw_entity_circles(j, scr_x, ent_tz(j), sy_off)
+                endif
+            endif
+        endif
+    next i
+
+    // Orbs in Region A (if clear of Region B)
+    cy = int(vh_half + sy_off)
+    for i = 1 to max_eproj
+        if (ep_vis(i)) then
+            scr_x = ep_scrx(i) : rad = ep_rad(i)
+            if (cy + rad < uy_top or scr_x + rad < ux1_snap or scr_x - rad > ux2_snap) then
+                color 255, 45, 30
+                fill circle scr_x, cy, rad
+                color 255, 235, 160
+                fill circle scr_x, cy, max(1, int(rad * 0.5))
+            endif
+        endif
+    next i
+
+    // Sparks in Region A
+    for i = 1 to max_sparks
+        if (sp_vis(i)) then
+            scr_x = sp_scrx(i) : sy = sp_scry(i) : sz = sp_sz(i)
+            if (sy + sz < uy_top or scr_x + sz < ux1_snap or scr_x - sz > ux2_snap) then
+                set_spark_color(sp_col(i))
+                clip_fill_rect(scr_x - sz, sy - sz, scr_x + sz, sy + sz, 0, 0, sw - 1, vmax_y)
+            endif
+        endif
+    next i
+
+    // -------------------------------------------------
+    // STEP 5: PHASE B - REFRESH TINY WEAPON ZONE & DRAW WEAPON IMMEDIATELY
+    // -------------------------------------------------
+    for c = uc0 to uc1
+        draw_col_slice(c, uy_top, vmax_y, 1, unlocked, sy_off)
+    next c
+
+    // Entities overlapping Region B
+    for i = 1 to cnt
+        j = draw_ord(i)
+        if (ent_vis(j)) then
+            scr_x = ent_scrx(j) : pad_w = ent_padw(j)
+            if (scr_x + pad_w >= ux1_snap and scr_x - pad_w <= ux2_snap) then
+                draw_entity_clipped(j, scr_x, ent_tz(j), sy_off, ux1_snap, uy_top, ux2_snap, vmax_y, 0)
+                spr_h = int(vh / ent_tz(j))
+                if (ent_type(j) = 2) then
+                    cy = int(vh_half - spr_h * 0.08 + sin(ent_bob(j)) * (spr_h * 0.08) + sy_off)
+                    er = max(3, int(spr_h * 0.16))
+                    if (cy + er >= uy_top) draw_entity_circles(j, scr_x, ent_tz(j), sy_off)
+                elsif (ent_type(j) = 4) then
+                    cy = int(vh_half - spr_h * 0.04 + sin(ent_bob(j) * 0.7) * (spr_h * 0.05) + sy_off)
+                    er = int(max(5, int(spr_h * 0.34)) * 1.25)
+                    if (cy + er >= uy_top) draw_entity_circles(j, scr_x, ent_tz(j), sy_off)
+                endif
+            endif
+        endif
+    next i
+
+    // Orbs overlapping Region B
+    cy = int(vh_half + sy_off)
+    for i = 1 to max_eproj
+        if (ep_vis(i)) then
+            scr_x = ep_scrx(i) : rad = ep_rad(i)
+            if (cy + rad >= uy_top and scr_x + rad >= ux1_snap and scr_x - rad <= ux2_snap) then
+                color 255, 45, 30
+                fill circle scr_x, cy, rad
+                color 255, 235, 160
+                fill circle scr_x, cy, max(1, int(rad * 0.5))
+            endif
+        endif
+    next i
+
+    // Sparks overlapping Region B
+    for i = 1 to max_sparks
+        if (sp_vis(i)) then
+            scr_x = sp_scrx(i) : sy = sp_scry(i) : sz = sp_sz(i)
+            if (sy + sz >= uy_top and scr_x + sz >= ux1_snap and scr_x - sz <= ux2_snap) then
+                set_spark_color(sp_col(i))
+                clip_fill_rect(scr_x - sz, sy - sz, scr_x + sz, sy + sz, ux1_snap, uy_top, ux2_snap, vmax_y)
+            endif
+        endif
+    next i
+
+    // Weapon Laser Tracer Flash
+    if (tracer_timer > 0) then
+        set_spark_color(tracer_col)
+        line int(sw / 2) + 28, vh - 46 to int(sw / 2) + sx_off, vh_half + sy_off
+        line int(sw / 2) + 29, vh - 46 to int(sw / 2) + sx_off + 1, vh_half + sy_off
+    endif
+
+    // Draw Weapon & Crosshair immediately on top!
+    draw_weapon_viewmodel(bx, by)
+    draw_crosshair()
+
+    // Status Alert Banner at top of 3D view
+    banner_on = (status_timer > 0)
+    if (banner_on) then
+        color 8, 18, 38
+        fill rectangle 190, 10, 610, 36
+        color 0, 240, 255
+        rectangle 190, 10, 610, 36
+        text 400, 23, status_msg$, "cc"
+    endif
+
+    // Player Hit Screen-Border Vignette
+    if (hit_flash > 0) then
+        color 255, 30, 45
+        rectangle 1, 1, sw - 2, vmax_y - 1
+        rectangle 4, 4, sw - 5, vmax_y - 4
+        rectangle 8, 8, sw - 9, vmax_y - 8
+    endif
+
+    // Save frame state for next frame's delta renderer
+    for c = 0 to num_rays - 1
+        prev_dtop(c) = r_dtop(c)
+        prev_dbot(c) = r_dbot(c)
+        col_dirty(c) = next_dirty(c)
+    next c
+    prev_wx1 = wx1 : prev_wx2 = wx2 : prev_wy_top = wy_top
+    prev_banner_on = banner_on
+    prev_hit_flash = hit_flash
+end sub
+
+sub draw_entity_clipped(idx, scr_x, tz, sy_off, rx1, ry1, rx2, ry2, unused_flag)
+    local t, spr_h, vx1, vx2, top_y, bot_y, cy, fl, stn, shade, bw, hp_w
+    local cx1, cy1, cx2, cy2
+
+    vx1 = max(ent_vx1(idx), rx1)
+    vx2 = min(ent_vx2(idx), rx2)
+    if (vx1 > vx2) return
+    cx1 = vx1 : cx2 = vx2 : cy1 = ry1 : cy2 = ry2
+    if (cy1 > cy2) return
+
+    t = ent_type(idx)
+    spr_h = int(vh / tz)
+    fl = ent_flash(idx)
+    stn = ent_stun(idx)
+    shade = min(1.0, 1.35 / (0.55 + tz * 0.38))
+
+    // TYPE 1: Security Sentry Bot
+    if (t = 1) then
+        bot_y = int(vh_half + spr_h * 0.46 + sy_off)
+        top_y = int(vh_half - spr_h * 0.34 + sy_off)
+        bw = max(2, int(spr_h * 0.22))
+
+        if (fl > 0) then color 255, 255, 255 else color 55 * shade, 68 * shade, 92 * shade endif
+        clip_fill_rect(scr_x - bw, int(vh_half + spr_h * 0.15 + sy_off), scr_x - int(bw * 0.25), bot_y, cx1, cy1, cx2, cy2)
+        clip_fill_rect(scr_x + int(bw * 0.25), int(vh_half + spr_h * 0.15 + sy_off), scr_x + bw, bot_y, cx1, cy1, cx2, cy2)
+
+        if (fl > 0) then
+            color 255, 255, 255
+        elsif (stn > 0) then
+            color 40 * shade, 190 * shade, 255 * shade
+        else
+            color 85 * shade, 105 * shade, 138 * shade
+        endif
+        clip_fill_rect(scr_x - bw, top_y, scr_x + bw, int(vh_half + spr_h * 0.18 + sy_off), cx1, cy1, cx2, cy2)
+
+        if (fl = 0) then
+            color 255 * shade, 35 * shade, 45 * shade
+            cy = int(max(0, top_y) + spr_h * 0.14)
+            clip_fill_rect(scr_x - int(bw * 0.7), cy, scr_x + int(bw * 0.7), cy + max(2, int(spr_h * 0.08)), cx1, cy1, cx2, cy2)
+        endif
+
+    // TYPE 2: Sentinel Hover Drone (wings)
+    elsif (t = 2) then
+        cy = int(vh_half - spr_h * 0.08 + sin(ent_bob(idx)) * (spr_h * 0.08) + sy_off)
+        bw = max(3, int(spr_h * 0.16))
+        if (fl > 0) then color 255, 255, 255 else color 180 * shade, 35 * shade, 55 * shade endif
+        clip_fill_rect(scr_x - int(bw * 1.7), cy - int(bw * 0.3), scr_x + int(bw * 1.7), cy + int(bw * 0.3), cx1, cy1, cx2, cy2)
+
+    // TYPE 3: AI Mainframe Core
+    elsif (t = 3) then
+        top_y = int(vh_half - spr_h * 0.44 + sy_off)
+        bot_y = int(vh_half + spr_h * 0.46 + sy_off)
+        bw = max(3, int(spr_h * 0.24))
+
+        if (fl > 0) then color 255, 255, 255 else color 35 * shade, 16 * shade, 52 * shade endif
+        clip_fill_rect(scr_x - bw, top_y, scr_x + bw, bot_y, cx1, cy1, cx2, cy2)
+
+        if (fl = 0) then
+            if (mod(int(anim_clock / 4), 2) = 0) then
+                color 255 * shade, 30 * shade, 175 * shade
+            else
+                color 0, 240 * shade, 255 * shade
+            endif
+            clip_fill_rect(scr_x - int(bw * 0.45), max(0, top_y) + 4, scr_x + int(bw * 0.45), max(max(0, top_y) + 5, min(vh - 1, bot_y) - 4), cx1, cy1, cx2, cy2)
+        endif
+
+        if (ent_hp(idx) < ent_maxhp(idx) and top_y > 10) then
+            hp_w = max(2, int((ent_hp(idx) / ent_maxhp(idx)) * (bw * 2)))
+            color 40, 10, 30
+            clip_fill_rect(scr_x - bw, top_y - 9, scr_x + bw, top_y - 4, cx1, cy1, cx2, cy2)
+            color 255, 40, 180
+            clip_fill_rect(scr_x - bw, top_y - 9, scr_x - bw + hp_w, top_y - 4, cx1, cy1, cx2, cy2)
+        endif
+
+    // TYPE 4: APEX AI OVERLORD
+    elsif (t = 4) then
+        cy = int(vh_half - spr_h * 0.04 + sin(ent_bob(idx) * 0.7) * (spr_h * 0.05) + sy_off)
+        bw = max(5, int(spr_h * 0.34))
+
+        if (fl > 0) then color 255, 255, 255 else color 95 * shade, 14 * shade, 34 * shade endif
+        clip_fill_rect(scr_x - bw, cy - int(bw * 0.85), scr_x + bw, cy + int(bw * 0.85), cx1, cy1, cx2, cy2)
+
+        color 50 * shade, 55 * shade, 75 * shade
+        clip_fill_rect(scr_x - int(bw * 1.35), cy - int(bw * 0.4), scr_x - bw, cy + int(bw * 0.5), cx1, cy1, cx2, cy2)
+        clip_fill_rect(scr_x + bw, cy - int(bw * 0.4), scr_x + int(bw * 1.35), cy + int(bw * 0.5), cx1, cy1, cx2, cy2)
+
+        if (cy - bw > 14) then
+            hp_w = max(2, int((ent_hp(idx) / ent_maxhp(idx)) * (bw * 2)))
+            color 40, 10, 10
+            clip_fill_rect(scr_x - bw, cy - bw - 10, scr_x + bw, cy - bw - 4, cx1, cy1, cx2, cy2)
+            color 255, 45, 55
+            clip_fill_rect(scr_x - bw, cy - bw - 10, scr_x - bw + hp_w, cy - bw - 4, cx1, cy1, cx2, cy2)
+        endif
+
+    // TYPE 5: Nano-Medkit Pickup
+    elsif (t = 5) then
+        cy = int(vh_half + spr_h * 0.32 + sin(ent_bob(idx)) * (spr_h * 0.04) + sy_off)
+        bw = max(3, int(spr_h * 0.13))
+        if (cy - bw <= vh - 1) then
+            color 210 * shade, 235 * shade, 245 * shade
+            clip_fill_rect(scr_x - bw, cy - bw, scr_x + bw, cy + bw, cx1, cy1, cx2, cy2)
+            color 0, 235 * shade, 110 * shade
+            clip_fill_rect(scr_x - int(bw * 0.28), cy - int(bw * 0.7), scr_x + int(bw * 0.28), cy + int(bw * 0.7), cx1, cy1, cx2, cy2)
+            clip_fill_rect(scr_x - int(bw * 0.7), cy - int(bw * 0.28), scr_x + int(bw * 0.7), cy + int(bw * 0.28), cx1, cy1, cx2, cy2)
+        endif
+
+    // TYPE 6: Ammo / Energy Cell Pickup
+    elsif (t = 6) then
+        cy = int(vh_half + spr_h * 0.32 + sin(ent_bob(idx)) * (spr_h * 0.04) + sy_off)
+        bw = max(3, int(spr_h * 0.12))
+        if (cy - bw <= vh - 1) then
+            color 30 * shade, 55 * shade, 95 * shade
+            clip_fill_rect(scr_x - bw, cy - bw, scr_x + bw, cy + bw, cx1, cy1, cx2, cy2)
+            color 0, 245 * shade, 255 * shade
+            clip_fill_rect(scr_x - int(bw * 0.65), cy - int(bw * 0.45), scr_x + int(bw * 0.65), cy + int(bw * 0.45), cx1, cy1, cx2, cy2)
+        endif
+    endif
+end sub
+
+sub draw_entity_circles(idx, scr_x, tz, sy_off)
+    local t, spr_h, cy, bw, fl, stn, shade, er, vmax_y
+    vmax_y = vh - 1
+    t = ent_type(idx)
+    if (t <> 2 and t <> 4) return
+
+    spr_h = int(vh / tz)
+    fl = ent_flash(idx)
+    stn = ent_stun(idx)
+    shade = min(1.0, 1.35 / (0.55 + tz * 0.38))
+
+    if (t = 2) then
+        cy = int(vh_half - spr_h * 0.08 + sin(ent_bob(idx)) * (spr_h * 0.08) + sy_off)
+        bw = max(3, int(spr_h * 0.16))
+        if (scr_x + bw >= ent_vx1(idx) and scr_x - bw <= ent_vx2(idx)) then
+            if (cy - bw >= 0 and cy + bw <= vmax_y) then
+                if (fl > 0) then
+                    color 255, 255, 255
+                elsif (stn > 0) then
+                    color 0, 230 * shade, 255 * shade
+                else
+                    color 45 * shade, 55 * shade, 80 * shade
+                endif
+                fill circle scr_x, cy, bw
+                color 255 * shade, 220 * shade, 30 * shade
+                fill circle scr_x, cy, max(2, int(bw * 0.42))
+            endif
+        endif
+    elsif (t = 4) then
+        cy = int(vh_half - spr_h * 0.04 + sin(ent_bob(idx) * 0.7) * (spr_h * 0.05) + sy_off)
+        bw = max(5, int(spr_h * 0.34))
+        if (cores_left > 0) then
+            er = int(bw * 1.25)
+            if (cy - er >= 0 and cy + er <= vmax_y and scr_x - er >= 0 and scr_x + er < sw) then
+                color 0, 240, 255
+                circle scr_x, cy, er
+            endif
+        endif
+        er = max(3, int(bw * 0.38))
+        if (cy - er >= 0 and cy + er <= vmax_y and scr_x + er >= ent_vx1(idx) and scr_x - er <= ent_vx2(idx)) then
+            color 255, 50, 20
+            fill circle scr_x, cy, er
+            color 255, 240, 180
+            fill circle scr_x, cy, max(2, int(bw * 0.18))
+        endif
+    endif
+end sub
+
+sub set_spark_color(cid)
+    if (cid = 1) color 0, 245, 255
+    if (cid = 2) color 255, 40, 190
+    if (cid = 3) color 255, 225, 40
+    if (cid = 4) color 255, 65, 30
+    if (cid = 5) color 0, 255, 140
+    if (cid = 6) color 220, 255, 255
+end sub
+
+// ============================================================================
+// FIRST-PERSON WEAPON VIEWMODEL, CROSSHAIR & ZERO-PUTBIT CYBER HUD
+// ============================================================================
+
+sub draw_clipped_trap(xt1, xt2, yt, xb1, xb2, yb, max_y)
+    local t, cx1, cx2, cyb
+    if (yt >= max_y) return
+    cyb = yb
+    cx1 = xb1
+    cx2 = xb2
+    if (cyb > max_y) then
+        t = (max_y - yt) / (cyb - yt)
+        cx1 = int(xt1 + (xb1 - xt1) * t)
+        cx2 = int(xt2 + (xb2 - xt2) * t)
+        cyb = max_y
+    endif
+    fill triangle xt1, yt, xt2, yt, cx2, cyb
+    fill triangle xt1, yt, cx1, cyb, cx2, cyb
+end sub
+
+sub draw_weapon_viewmodel(bx, by)
+    local vmax_y, mrad
+    vmax_y = vh - 1
+
+    if (muzzle_t > 0) then
+        if (cur_wep = 1) then
+            mrad = min(18, max(2, vmax_y - (by - 92)))
+            if (by - 92 < vmax_y) then
+                color 0, 255, 240
+                fill circle bx + 20, by - 92, mrad
+                color 255, 255, 255
+                fill circle bx + 20, by - 92, max(1, int(mrad / 2))
+            endif
+        elsif (cur_wep = 2) then
+            mrad = min(28, max(2, vmax_y - (by - 88)))
+            if (by - 88 < vmax_y) then
+                color 255, 185, 30
+                fill circle bx + 12, by - 88, mrad
+                color 255, 255, 210
+                fill circle bx + 12, by - 88, max(1, int(mrad / 2))
+            endif
+        else
+            mrad = min(24, max(2, vmax_y - (by - 102)))
+            if (by - 102 < vmax_y) then
+                color 0, 255, 255
+                fill circle bx + 18, by - 102, mrad
+                color 255, 255, 255
+                fill circle bx + 18, by - 102, max(1, int(mrad / 2))
+            endif
+        endif
+    endif
+
+    if (cur_wep = 1) then
+        // [1] PULSE RIFLE
+        color 28, 38, 58
+        draw_clipped_trap(bx + 8, bx + 32, by - 90, bx - 4, bx + 54, by, vmax_y)
+        color 45, 60, 88
+        clip_fill_rect(bx + 12, by - 94, bx + 28, by - 36, 0, 0, sw - 1, vmax_y)
+        color 0, 240, 255
+        clip_fill_rect(bx + 16, by - 82, bx + 24, by - 45, 0, 0, sw - 1, vmax_y)
+        if (by - 94 >= 0 and by - 94 <= vmax_y) line bx + 12, by - 94 to bx + 28, by - 94
+    elsif (cur_wep = 2) then
+        // [2] TWIN PLASMA SHOTGUN
+        color 34, 40, 56
+        draw_clipped_trap(bx - 8, bx + 36, by - 86, bx - 22, bx + 65, by, vmax_y)
+        color 60, 72, 96
+        clip_fill_rect(bx - 2, by - 90, bx + 11, by - 35, 0, 0, sw - 1, vmax_y)
+        clip_fill_rect(bx + 17, by - 90, bx + 30, by - 35, 0, 0, sw - 1, vmax_y)
+        color 255, 165, 20
+        clip_fill_rect(bx + 1, by - 78, bx + 8, by - 50, 0, 0, sw - 1, vmax_y)
+        clip_fill_rect(bx + 20, by - 78, bx + 27, by - 50, 0, 0, sw - 1, vmax_y)
+    else
+        // [3] EMP RAILGUN
+        color 20, 34, 62
+        draw_clipped_trap(bx + 2, bx + 34, by - 104, bx - 14, bx + 60, by, vmax_y)
+        color 0, 175, 235
+        clip_fill_rect(bx + 4, by - 106, bx + 11, by - 25, 0, 0, sw - 1, vmax_y)
+        clip_fill_rect(bx + 25, by - 106, bx + 32, by - 25, 0, 0, sw - 1, vmax_y)
+        color 210, 255, 255
+        clip_fill_rect(bx + 15, by - 96, bx + 21, by - 35, 0, 0, sw - 1, vmax_y)
+    endif
+end sub
+
+sub draw_crosshair()
+    local cx, cy
+    cx = int(sw / 2) : cy = vh_half
+    color 0, 245, 255
+    line cx - 9, cy to cx - 4, cy
+    line cx + 4, cy to cx + 9, cy
+    line cx, cy - 9 to cx, cy - 4
+    line cx, cy + 4 to cx, cy + 9
+    dot cx, cy
+
+    if (hit_mark > 0) then
+        color 255, 60, 70
+        line cx - 8, cy - 8 to cx - 3, cy - 3
+        line cx + 3, cy - 3 to cx + 8, cy - 8
+        line cx - 8, cy + 8 to cx - 3, cy + 3
+        line cx + 3, cy + 3 to cx + 8, cy + 8
+    endif
+end sub
+
+sub mmap_draw_tile(c, r, unlocked_flag)
+    local rx0, ry0, cs, wt
+    rx0 = 14 : ry0 = hud_y + 7 : cs = 6
+    wt = wmap(c, r)
+    if (wt > 0) then
+        if (wt = 4) then
+            if (unlocked_flag) then color 0, 255, 145 else color 255, 45, 65 endif
+        elsif (wt = 2) then
+            color 0, 120, 180
+        elsif (wt = 3) then
+            color 130, 35, 65
+        else
+            color 45, 70, 110
+        endif
+        fill rectangle rx0 + (c - 1) * cs, ry0 + (r - 1) * cs, rx0 + c * cs - 1, ry0 + r * cs - 1
+    endif
+end sub
+
+sub mmap_restore_box(bx1, by1, bx2, by2, unlocked_flag)
+    local rx0, ry0, cs, x1, y1, x2, y2, c1, c2, r1, r2, r, c
+    rx0 = 14 : ry0 = hud_y + 7 : cs = 6
+    x1 = max(rx0, bx1) : y1 = max(ry0, by1)
+    x2 = min(rx0 + map_w * cs - 1, bx2) : y2 = min(ry0 + map_h * cs - 1, by2)
+    if (x1 > x2 or y1 > y2) return
+
+    color 5, 10, 20
+    fill rectangle x1, y1, x2, y2
+
+    c1 = max(1, int((x1 - rx0) / cs) + 1)
+    c2 = min(map_w, int((x2 - rx0) / cs) + 1)
+    r1 = max(1, int((y1 - ry0) / cs) + 1)
+    r2 = min(map_h, int((y2 - ry0) / cs) + 1)
+    for r = r1 to r2
+        for c = c1 to c2
+            if (wmap(c, r) > 0) mmap_draw_tile(c, r, unlocked_flag)
+        next c
+    next r
+end sub
+
+sub draw_hud_static(fl, fname$)
+    local rx0, ry0, cs, r, c, i
+    rx0 = 14 : ry0 = hud_y + 7 : cs = 6
+
+    // Bottom Tactical Console Background (drawn once per floor)
+    color 10, 15, 28
+    fill rectangle 0, hud_y, sw, sh
+    color 0, 175, 235
+    line 0, hud_y to sw, hud_y
+    line 0, hud_y + 1 to sw, hud_y + 1
+
+    // Minimap Frame & Static Walls (drawn once per floor!)
+    color 5, 10, 20
+    fill rectangle rx0 - 2, ry0 - 2, rx0 + map_w * cs + 1, ry0 + map_h * cs + 1
+    color 30, 80, 130
+    rectangle rx0 - 2, ry0 - 2, rx0 + map_w * cs + 1, ry0 + map_h * cs + 1
+    for r = 1 to map_h
+        for c = 1 to map_w
+            if (wmap(c, r) > 0) mmap_draw_tile(c, r, 0)
+        next c
+    next r
+
+    // Panel 2 Frame & Static Header
+    color 16, 26, 48
+    fill rectangle 126, hud_y + 8, 398, sh - 8
+    color 35, 85, 140
+    rectangle 126, hud_y + 8, 398, sh - 8
+    color 0, 245, 255
+    text 138, hud_y + 23, "FLR " + str$(fl) + " // " + fname$, "lc"
+
+    // Panel 3 Frame & Static Header
+    color 16, 26, 48
+    fill rectangle 410, hud_y + 8, 650, sh - 8
+    color 35, 85, 140
+    rectangle 410, hud_y + 8, 650, sh - 8
+    color 150, 195, 240
+    text 530, hud_y + 22, ":: ARSENAL [1-3] ::", "cc"
+
+    // Panel 4 Frame
+    color 16, 26, 48
+    fill rectangle 662, hud_y + 8, 786, sh - 8
+    color 35, 85, 140
+    rectangle 662, hud_y + 8, 786, sh - 8
+
+    // Reset HUD & Delta Buffers
+    prev_score = -1 : prev_bots = -1 : prev_hp = -1 : prev_cores = -1
+    prev_wep = -1 : prev_shl = -1 : prev_cel = -1 : prev_unlocked = 0 : prev_visor = -1
+    for i = 1 to max_ents : prev_ent_mx(i) = -1 : prev_ent_my(i) = -1 : next i
+    prev_pmx = -1 : prev_pmy = -1 : prev_plx = -1 : prev_ply = -1
+
+    for i = 0 to num_rays - 1
+        prev_dtop(i) = 0 : prev_dbot(i) = vh - 1
+        col_dirty(i) = 1 : next_dirty(i) = 1
+    next i
+    prev_wx1 = int(sw / 2) - 30 : prev_wx2 = int(sw / 2) + 70 : prev_wy_top = vh - 115
+    prev_banner_on = 0 : prev_hit_flash = 0
+end sub
+
+sub draw_hud_dynamic(fl, cur_score, cur_hp, m_hp, n_shl, n_cel, wep, cores, bots)
+    local mx, my, rx0, ry0, cs, px_m, py_m, lx, ly, i, hp_w, ey, unl, visor_st
+    local xmin, ymin, xmax, ymax, t
+
+    // -------------------------
+    // PANEL 1: INCREMENTAL RADAR MINIMAP (Zero putbit!)
+    // -------------------------
+    rx0 = 14 : ry0 = hud_y + 7 : cs = 6
+    xmin = rx0 + 2 : ymin = ry0 + 2
+    xmax = rx0 + map_w * cs - 3 : ymax = ry0 + map_h * cs - 3
+
+    unl = (cores = 0)
+    if (unl <> prev_unlocked) then
+        if (exit_x > 0) mmap_draw_tile(exit_x, exit_y, unl)
+        prev_unlocked = unl
+    endif
+
+    // Erase moved/destroyed entity blips only
+    for i = 1 to max_ents
+        if (ent_act(i) and ent_type(i) <= 4) then
+            mx = max(xmin + 1, min(xmax - 1, rx0 + int((ent_x(i) - 1) * cs)))
+            my = max(ymin + 1, min(ymax - 1, ry0 + int((ent_y(i) - 1) * cs)))
+            if (prev_ent_mx(i) <> -1 and (mx <> prev_ent_mx(i) or my <> prev_ent_my(i))) then
+                mmap_restore_box(prev_ent_mx(i) - 3, prev_ent_my(i) - 3, prev_ent_mx(i) + 3, prev_ent_my(i) + 3, unl)
+            endif
+        elsif (prev_ent_mx(i) <> -1) then
+            mmap_restore_box(prev_ent_mx(i) - 3, prev_ent_my(i) - 3, prev_ent_mx(i) + 3, prev_ent_my(i) + 3, unl)
+            prev_ent_mx(i) = -1
+        endif
+    next i
+
+    // Erase old player dot + look vector only when moved/turned
+    px_m = max(xmin, min(xmax, rx0 + int((px - 1) * cs)))
+    py_m = max(ymin, min(ymax, ry0 + int((py - 1) * cs)))
+    lx = max(rx0, min(rx0 + map_w * cs - 1, int(px_m + dir_x * 8)))
+    ly = max(ry0, min(ry0 + map_h * cs - 1, int(py_m + dir_y * 8)))
+    if (prev_pmx <> -1 and (px_m <> prev_pmx or py_m <> prev_pmy or lx <> prev_plx or ly <> prev_ply)) then
+        mmap_restore_box(min(prev_pmx - 2, prev_plx), min(prev_pmy - 2, prev_ply), max(prev_pmx + 2, prev_plx), max(prev_pmy + 2, prev_ply), unl)
+    endif
+
+    // Draw active entity blips
+    for i = 1 to max_ents
+        if (ent_act(i)) then
+            t = ent_type(i)
+            if (t <= 4) then
+                mx = max(xmin + 1, min(xmax - 1, rx0 + int((ent_x(i) - 1) * cs)))
+                my = max(ymin + 1, min(ymax - 1, ry0 + int((ent_y(i) - 1) * cs)))
+                if (t = 3) then
+                    color 255, 40, 200
+                    fill rectangle mx - 2, my - 2, mx + 2, my + 2
+                elsif (t = 4) then
+                    color 255, 40, 40
+                    fill rectangle mx - 3, my - 3, mx + 3, my + 3
+                else
+                    color 255, 175, 40
+                    fill rectangle mx - 1, my - 1, mx + 1, my + 1
+                endif
+                prev_ent_mx(i) = mx
+                prev_ent_my(i) = my
+            endif
+        endif
+    next i
+
+    // Draw player dot & look vector
+    color 0, 255, 240
+    fill circle px_m, py_m, 2
+    line px_m, py_m to lx, ly
+    prev_pmx = px_m : prev_pmy = py_m : prev_plx = lx : prev_ply = ly
+
+    // -------------------------
+    // PANEL 2: VITALS & OBJECTIVE (Dirty-Checked)
+    // -------------------------
+    if (cur_score <> prev_score or bots <> prev_bots) then
+        color 16, 26, 48
+        fill rectangle 132, hud_y + 33, 394, hud_y + 51
+        color 165, 205, 245
+        text 138, hud_y + 42, "SCORE: " + str$(cur_score) + "   HOSTILES: " + str$(bots), "lc"
+        prev_score = cur_score
+        prev_bots = bots
+    endif
+
+    if (cur_hp <> prev_hp) then
+        color 16, 26, 48
+        fill rectangle 132, hud_y + 53, 223, hud_y + 74
+        if (cur_hp > 50) then
+            color 0, 255, 140
+        elsif (cur_hp > 25) then
+            color 255, 210, 0
+        else
+            color 255, 45, 55
+        endif
+        text 138, hud_y + 64, "HULL: " + str$(cur_hp) + "%", "lc"
+
+        color 25, 35, 55
+        fill rectangle 225, hud_y + 56, 385, hud_y + 72
+        hp_w = max(0, int((cur_hp / m_hp) * 156))
+        if (cur_hp > 50) then color 0, 255, 140 elsif (cur_hp > 25) then color 255, 210, 0 else color 255, 45, 55 endif
+        if (hp_w > 0) fill rectangle 227, hud_y + 58, 227 + hp_w, hud_y + 70
+        prev_hp = cur_hp
+    endif
+
+    if (cores <> prev_cores) then
+        color 16, 26, 48
+        fill rectangle 132, hud_y + 78, 394, hud_y + 98
+        if (fl < 3) then
+            if (cores > 0) then
+                color 255, 65, 195
+                text 262, hud_y + 90, "AI CORES REMAINING: " + str$(cores), "cc"
+            else
+                color 0, 255, 150
+                text 262, hud_y + 90, ">> EXIT AIRLOCK UNLOCKED <<", "cc"
+            endif
+        else
+            if (cores > 0) then
+                color 255, 65, 195
+                text 262, hud_y + 90, "SHIELD CORES: " + str$(cores) + " | OVERLORD ACTIVE", "cc"
+            else
+                color 255, 55, 65
+                text 262, hud_y + 90, "SHIELD DOWN! TERMINATE OVERLORD!", "cc"
+            endif
+        endif
+        prev_cores = cores
+    endif
+
+    // -------------------------
+    // PANEL 3: WEAPON ARSENAL (Dirty-Checked)
+    // -------------------------
+    if (wep <> prev_wep or n_shl <> prev_shl or n_cel <> prev_cel) then
+        color 16, 26, 48
+        fill rectangle 416, hud_y + 32, 644, sh - 12
+
+        if (wep = 1) then color 0, 255, 240 else color 110, 145, 190 endif
+        text 424, hud_y + 44, "[1] PULSE RIFLE      INF", "lc"
+
+        if (wep = 2) then color 255, 185, 40 else color 110, 145, 190 endif
+        text 424, hud_y + 66, "[2] PLASMA SHOTGUN   " + str$(n_shl), "lc"
+
+        if (wep = 3) then color 0, 255, 240 else color 110, 145, 190 endif
+        text 424, hud_y + 88, "[3] EMP RAILGUN      " + str$(n_cel), "lc"
+
+        prev_wep = wep
+        prev_shl = n_shl
+        prev_cel = n_cel
+    endif
+
+    // -------------------------
+    // PANEL 4: CYBER-MARINE VISOR PORTRAIT (Dirty-Checked)
+    // -------------------------
+    if (hit_flash > 0) then
+        visor_st = 3
+    elsif (cur_hp <= 25) then
+        visor_st = 2
+    elsif (muzzle_t > 0) then
+        visor_st = 1
+    else
+        visor_st = 0
+    endif
+
+    if (visor_st <> prev_visor) then
+        if (hit_flash > 0) then color 140, 20, 30 else color 35, 52, 82 endif
+        fill circle 724, hud_y + 55, 30
+        color 0, 180, 235
+        circle 724, hud_y + 55, 30
+
+        ey = hud_y + 49
+        if (hit_flash > 0 or cur_hp <= 25) then
+            color 255, 45, 55
+        elsif (muzzle_t > 0) then
+            color 255, 255, 220
+        else
+            color 0, 245, 255
+        endif
+        fill rectangle 704, ey, 744, ey + 10
+        color 12, 20, 36
+        fill rectangle 722, ey, 726, ey + 10
+        prev_visor = visor_st
+    endif
+end sub
+
+// ============================================================================
+// UI SCREENS (TITLE, FLOOR BRIEFING, VICTORY, GAME OVER - FLICKER-FREE)
+// ============================================================================
+
+sub title_screen()
+    local clk, k$, i, sx1, sy1, sx2, sy2, blink_on, prev_blink
+
+    color 5, 9, 22
+    fill rectangle 0, 0, sw, sh
+
+    color 14, 34, 68
+    for i = 0 to 6
+        sx1 = 400 - (140 + i * 75) : sy1 = 300 - (95 + i * 50)
+        sx2 = 400 + (140 + i * 75) : sy2 = 300 + (95 + i * 50)
+        rectangle sx1, sy1, sx2, sy2
+    next i
+    line 0, 0 to 260, 205
+    line sw, 0 to 540, 205
+    line 0, sh to 260, 395
+    line sw, sh to 540, 395
+
+    color 8, 16, 36
+    fill rectangle 145, 48, 655, 162
+    color 0, 245, 255
+    rectangle 145, 48, 655, 162
+    color 255, 35, 165
+    text 400, 84, "D A T A   D E M I S E", "cc"
+    color 0, 245, 255
+    text 400, 120, "CYBERNETIC FIRST-PERSON DATA CENTER ASSAULT", "cc"
+    color 130, 175, 225
+    text 400, 144, "3 SECTORS  //  SWITCHABLE ARSENAL  //  OVERLORD BOSS", "cc"
+
+    color 8, 16, 36
+    fill rectangle 150, 195, 650, 445
+    color 30, 105, 175
+    rectangle 150, 195, 650, 445
+
+    color 0, 255, 240
+    text 400, 220, ":: TACTICAL CONTROLS ::", "cc"
+    color 190, 225, 255
+    text 210, 260, "UP / DOWN (or W/S)   : MOVE FORWARD / BACK", "lc"
+    text 210, 292, "LEFT / RIGHT ARROWS  : TURN VIEW", "lc"
+    text 210, 324, "A / D KEYS           : STRAFE LEFT / RIGHT", "lc"
+    text 210, 356, "SPACEBAR             : FIRE WEAPON", "lc"
+    text 210, 388, "1 / 2 / 3            : PULSE / SHOTGUN / RAILGUN", "lc"
+    text 210, 420, "Q / ESC              : ABORT MISSION", "lc"
+
+    color 115, 155, 210
+    text 400, 555, "HIGH SCORE RECORD: " + str$(hi_score), "cc"
+
+    clk = 0 : prev_blink = -1
+    while (1)
+        clk = clk + 1
+        blink_on = (mod(int(clk / 16), 2) = 0)
+        if (blink_on <> prev_blink) then
+            if (blink_on) then
+                color 0, 48, 42
+                fill rectangle 205, 478, 595, 516
+                color 0, 255, 155
+                rectangle 205, 478, 595, 516
+                text 400, 497, ">> PRESS SPACE TO BREACH DATA CENTER <<", "cc"
+            else
+                color 5, 9, 22
+                fill rectangle 204, 477, 596, 517
+            endif
+            prev_blink = blink_on
+        endif
+
+        sleep 0.02
+        k$ = inkey$(0)
+        if (k$ = " ") break
+        if (k$ = "q" or k$ = "Q" or k$ = "esc") exit
+    wend
+end sub
+
+sub floor_intro_screen(fl, fname$)
+    local t, k$
+
+    color 5, 9, 22
+    fill rectangle 0, 0, sw, sh
+    color 8, 18, 38
+    fill rectangle 170, 200, 630, 390
+    color 0, 240, 255
+    rectangle 170, 200, 630, 390
+
+    color 255, 45, 175
+    text 400, 245, "INFILTRATING FLOOR 0" + str$(fl), "cc"
+    color 0, 255, 240
+    text 400, 285, fname$, "cc"
+    color 175, 215, 255
+    if (fl < 3) then
+        text 400, 330, "OBJECTIVE: SHATTER ALL AI CORES & REACH EXIT", "cc"
+    else
+        text 400, 330, "OBJECTIVE: BREAK SHIELD CORES & KILL OVERLORD", "cc"
+    endif
+
+    for t = 1 to 75
+        sleep 0.02
+        k$ = inkey$(0)
+        if (t > 12 and k$ = " ") break
+    next t
+end sub
+
+sub victory_screen(final_score, top_score)
+    local t, k$, blink_on, prev_blink
+
+    color 5, 14, 22
+    fill rectangle 0, 0, sw, sh
+    color 8, 28, 36
+    fill rectangle 150, 150, 650, 450
+    color 0, 255, 155
+    rectangle 150, 150, 650, 450
+    rectangle 156, 156, 644, 444
+
+    color 0, 255, 165
+    text 400, 205, "// DATA CENTER NEUTRALIZED //", "cc"
+    color 0, 245, 255
+    text 400, 245, "APEX AI OVERLORD DESTROYED - MISSION COMPLETE", "cc"
+    color 255, 225, 60
+    text 400, 305, "FINAL SCORE: " + str$(final_score), "cc"
+    color 165, 210, 245
+    text 400, 340, "HIGH SCORE:  " + str$(top_score), "cc"
+
+    prev_blink = -1
+    for t = 1 to 240
+        if (t > 35) then
+            blink_on = (mod(int(t / 14), 2) = 0)
+            if (blink_on <> prev_blink) then
+                if (blink_on) then
+                    color 0, 255, 165
+                    text 400, 405, ">> PRESS SPACE TO RETURN TO BRIEFING <<", "cc"
+                else
+                    color 8, 28, 36
+                    fill rectangle 170, 390, 630, 420
+                endif
+                prev_blink = blink_on
+            endif
+        endif
+        sleep 0.02
+        k$ = inkey$(0)
+        if (t > 35 and k$ = " ") break
+        if (k$ = "q" or k$ = "Q" or k$ = "esc") exit
+    next t
+end sub
+
+sub game_over_screen(final_score, top_score, reached_fl)
+    local t, k$, blink_on, prev_blink
+
+    color 10, 5, 12
+    fill rectangle 0, 0, sw, sh
+    color 22, 10, 20
+    fill rectangle 165, 155, 635, 445
+    color 255, 45, 65
+    rectangle 165, 155, 635, 445
+
+    color 255, 45, 65
+    text 400, 205, "// OPERATOR SIGNAL LOST //", "cc"
+    color 255, 210, 40
+    text 400, 245, "TERMINATED ON FLOOR 0" + str$(reached_fl), "cc"
+    color 0, 245, 255
+    text 400, 300, "FINAL SCORE: " + str$(final_score), "cc"
+    color 165, 200, 240
+    text 400, 335, "HIGH SCORE:  " + str$(top_score), "cc"
+
+    prev_blink = -1
+    for t = 1 to 200
+        if (t > 35) then
+            blink_on = (mod(int(t / 14), 2) = 0)
+            if (blink_on <> prev_blink) then
+                if (blink_on) then
+                    color 0, 255, 155
+                    text 400, 398, ">> PRESS SPACE TO REDEPLOY <<", "cc"
+                else
+                    color 22, 10, 20
+                    fill rectangle 180, 383, 620, 413
+                endif
+                prev_blink = blink_on
+            endif
+        endif
+        sleep 0.02
+        k$ = inkey$(0)
+        if (t > 35 and k$ = " ") break
+        if (k$ = "q" or k$ = "Q" or k$ = "esc") exit
+    next t
+end sub
